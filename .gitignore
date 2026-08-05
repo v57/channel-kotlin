@@ -1,0 +1,19 @@
+# Gradle build artifacts
+.gradle/
+build/
+**/build/
+
+# Kotlin
+.kotlin/
+
+# Java class files
+*.class
+
+# Test and coverage output
+coverage/
+
+# Benchmark output
+/benchmark.json
+
+# macOS
+.DS_Store
