@@ -62,6 +62,27 @@ class CoreParityTest {
   }
 
   @Test
+  fun mergeKeepsPostOtherAndStreamOtherRoutesUnderThePrefix() {
+    val inner = Channel<MutableMap<String, Any?>>()
+      .postOther<Unit, String, Unit>({ path -> path.startsWith("dyn/") }) { request -> "post:${request.path}" }
+      .streamOther<Unit, Int, Unit>({ path -> path == "feed" }) { request -> request.emitter.emit(1) }
+
+    val outer = Channel<MutableMap<String, Any?>>().merge(inner, "m").process(mutableMapOf())
+    assertEquals("post:m/dyn/x", outer.send<String>("m/dyn/x").requireOk())
+    assertTrue(outer.send<String>("dyn/x") is CallResult.RemoteErr)
+    outer.values<Int>("m/feed").use { values ->
+      values.next().requireItem(1)
+      values.next().requireDone()
+    }
+    outer.stop()
+
+    // Without a prefix the matchers are reused as-is
+    val flat = Channel<MutableMap<String, Any?>>().merge(inner).process(mutableMapOf())
+    assertEquals("post:dyn/x", flat.send<String>("dyn/x").requireOk())
+    flat.stop()
+  }
+
+  @Test
   @Timeout(60) // used to deadlock forever (AUDIT 3.2): nested calls from a handler must not hang the suite
   fun websocketClientAndServerSupportNestedCallsEventsAndHeaders() {
     var mirroredEvents = 0

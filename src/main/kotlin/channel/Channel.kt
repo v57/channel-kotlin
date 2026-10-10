@@ -361,7 +361,15 @@ class Channel<State>(
       value.setPrefix(mergedPath)
       subscriptions[mergedPath] = value
     }
+    other.otherPosts.forEach { otherPosts += OtherPost(prefixedMatcher(pathPrefix, it.matcher), it.handler) }
+    other.otherStreams.forEach { otherStreams += OtherStream(prefixedMatcher(pathPrefix, it.matcher), it.handler) }
     return this
+  }
+
+  private fun prefixedMatcher(prefix: String, matcher: (String) -> Boolean): (String) -> Boolean {
+    if (prefix.isEmpty()) return matcher
+    val scope = "$prefix/"
+    return { path -> path.startsWith(scope) && matcher(path.substring(scope.length)) }
   }
 
   fun process(state: State = makeDefaultState()): Process<State> {
