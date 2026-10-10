@@ -91,3 +91,11 @@ JVM-only Channel runtime aligned to `channel-zig` semantics:
 - `ConnectOptions.headers` is a raw HTTP header string.
 - `ListenOptions.state` receives the accepted headers as a `Map<String, String>`.
 - Blocking calls pump the global single-threaded transport registry internally; `poll()` is still required for idle servers, passive subscriptions, and externally driven progress.
+- Blocking calls made from inside a handler (a server handler calling back into the client that is waiting on it)
+  pump the transports re-entrantly, so nested calls complete instead of deadlocking.
+- `Channel.requestTimeout(millis)` fails blocking `send`/`subscribe`/`values().next()` with `"timeout"`; the default
+  `0` waits forever, like TS.
+- Limits: websocket messages (single or fragmented) above `maxPayload` (default 16 MiB, settable on
+  `ListenOptions`/`ConnectOptions`) and upgrade heads above 64 KiB drop the connection. A peer that sends a malformed
+  frame or invalid JSON is disconnected (client calls then fail with `"disconnected"`); JSON nested deeper than 512
+  levels is rejected.
