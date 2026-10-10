@@ -46,13 +46,18 @@ class SubscriptionHandle internal constructor(
 
 data class ConnectOptions<State>(
   val state: State? = null,
+  /** Raw extra header lines sent once with the upgrade request (there is no reconnect yet). */
   val headers: String? = null,
+  /** Largest websocket message accepted from the server; bigger ones disconnect (default 16 MiB). */
+  val maxPayload: Int = DEFAULT_MAX_PAYLOAD,
 )
 
 data class ListenOptions<State>(
   val state: ((Map<String, String>) -> State)? = null,
   val onConnect: ((State, Sender<State>) -> Unit)? = null,
   val onDisconnect: ((State, Sender<State>) -> Unit)? = null,
+  /** Largest websocket message accepted from a client; bigger ones drop that connection (default 16 MiB). */
+  val maxPayload: Int = DEFAULT_MAX_PAYLOAD,
 )
 
 data class PostRequest<State, Req, Ctx>(
@@ -264,6 +269,18 @@ class Channel<State>(
   private val otherPosts = mutableListOf<OtherPost<State>>()
   private val otherStreams = mutableListOf<OtherStream<State>>()
   private var onDisconnectAction: ((State, Sender<State>) -> Unit)? = null
+  internal var requestTimeoutMillis: Long = 0L
+    private set
+
+  /**
+   * Fails blocking `send`/`subscribe`/`values().next()` with "timeout" when no reply arrives within
+   * [millis]. 0 (the default, same as TS) waits forever.
+   */
+  fun requestTimeout(millis: Long): Channel<State> {
+    require(millis >= 0) { "timeout must be >= 0" }
+    requestTimeoutMillis = millis
+    return this
+  }
 
   inline fun <reified Req, reified Resp, reified Ctx> post(
     path: String,
@@ -437,7 +454,11 @@ class Channel<State>(
     try {
       val request = when {
         message.bodyJson == null -> Unit
-        else -> codec.decode(message.bodyJson)
+        else -> try {
+          codec.decode(message.bodyJson)
+        } catch (error: Exception) {
+          throw ChannelError("invalid subscription body")
+        }
       }
       val topic = subscription.topicOf(request)
       peer.addRemoteTopic(topic)
@@ -619,7 +640,7 @@ class Client<State> internal constructor(
 
   override fun stop() = peer.sender.stop()
 
-  fun poll(): Boolean = poller.poll()
+  fun poll(): Boolean = PumpRegistry.poll(poller)
 
   fun isConnected(): Boolean = peer.isConnected()
 
@@ -631,7 +652,7 @@ class Server<State> internal constructor(
   private val stopper: () -> Unit,
   private val portValue: Int,
 ) {
-  fun poll(): Boolean = poller.poll()
+  fun poll(): Boolean = PumpRegistry.poll(poller)
 
   fun stop() {
     stopper()
@@ -662,29 +683,47 @@ internal object PumpRegistry {
     entries.remove(entry)
   }
 
-  fun pumpAll(): Boolean {
-    if (pumpingDepth > 0) {
-      // Re-entrant pump: we are already inside an outer pumpAll (e.g.
-      // sendMessage -> pumpAll while a poll is mid-dispatch). Polling the
-      // same transports again from inside their own poll would recurse
-      // unboundedly when a single frame batches many messages (the
-      // benchmark burst clients send 2048-request arrays per frame) and
-      // blow the stack. The outermost pumpAll already iterates every
-      // registered entry, so nested calls have nothing extra to do.
-      return false
-    }
-
+  /** Polls one entry from a top-level `Server.poll()` / `Client.poll()`, counted as pumping. */
+  fun poll(entry: Pollable): Boolean {
     pumpingDepth += 1
-    return try {
+    try {
+      return entry.poll()
+    } finally {
+      pumpingDepth -= 1
+    }
+  }
+
+  /**
+   * Polls every transport. Used by blocking waits (`send`, `subscribe`, `values().next()`), which
+   * must make progress even when they run inside a handler that is itself being dispatched by an
+   * outer poll: the reply they wait for can only arrive through a nested poll of the same
+   * transports (the "mirror" pattern: client blocks in send, server handler calls the client back).
+   * Nesting depth is bounded by the number of nested blocking calls.
+   */
+  fun pumpAll(): Boolean {
+    pumpingDepth += 1
+    try {
       var progressed = false
       val snapshot = entries.toList()
       snapshot.forEach { entry ->
         progressed = entry.poll() || progressed
       }
-      progressed
+      return progressed
     } finally {
       pumpingDepth -= 1
     }
+  }
+
+  /**
+   * Opportunistic pump after writing a frame. Skipped while any poll is already running: a frame
+   * that batches many requests (the benchmark sends 2048 per frame) would otherwise re-enter the
+   * transport for every reply and overflow the stack. The running poll picks the work up anyway.
+   */
+  fun pumpIfIdle(): Boolean {
+    if (pumpingDepth > 0) {
+      return false
+    }
+    return pumpAll()
   }
 }
 
@@ -750,10 +789,13 @@ internal class Peer<State>(
       ),
     )
 
-    waitFor { call.done || stopped }
+    val settled = waitFor { call.done || stopped }
     pending.remove(id)
+    if (!settled) {
+      return CallResult.RemoteErr("timeout")
+    }
 
-    val error = call.errorText
+    val error = call.errorText ?: if (!call.done) "disconnected" else null
     if (error != null) {
       return CallResult.RemoteErr(error)
     }
@@ -761,7 +803,13 @@ internal class Peer<State>(
     if (normalizeClass(responseType) == Unit::class.java || responseBody == null) {
       return CallResult.Ok(null)
     }
-    return CallResult.Ok(codec.decode(responseBody, responseType))
+    return try {
+      CallResult.Ok(codec.decode(responseBody, responseType))
+    } catch (error: Throwable) {
+      if (error is VirtualMachineError && error !is StackOverflowError) throw error
+      // An undecodable reply settles the call with an error instead of throwing out of send().
+      CallResult.RemoteErr("invalid response body")
+    }
   }
 
   fun <Item> valuesTyped(itemType: Class<Item>, path: String, body: Any?, context: Any?): Values<Item> {
@@ -795,10 +843,13 @@ internal class Peer<State>(
       ),
     )
 
-    waitFor { pendingSubscribe.done || stopped }
+    val settled = waitFor { pendingSubscribe.done || stopped }
     pending.remove(id)
+    if (!settled) {
+      return SubscribeResult.RemoteErr("timeout")
+    }
 
-    val error = pendingSubscribe.errorText
+    val error = pendingSubscribe.errorText ?: if (!pendingSubscribe.done) "disconnected" else null
     if (error != null) {
       return SubscribeResult.RemoteErr(error)
     }
@@ -831,7 +882,7 @@ internal class Peer<State>(
       return
     }
     transport.sendFrame(WireCodec.encodeMessage(message))
-    PumpRegistry.pumpAll()
+    PumpRegistry.pumpIfIdle()
   }
 
   fun completeResponse(id: Int, message: ParsedMessage) {
@@ -985,12 +1036,22 @@ internal class Peer<State>(
 
   private fun nextRequestId(): Int = nextId++
 
-  private fun waitFor(condition: () -> Boolean) {
+  internal val requestTimeoutMillis: Long
+    get() = channel.requestTimeoutMillis
+
+  /** Pumps until [condition] holds; returns false if the channel's request timeout elapsed first. */
+  internal fun waitFor(condition: () -> Boolean): Boolean {
+    val timeout = requestTimeoutMillis
+    val deadline = if (timeout > 0) System.nanoTime() + timeout * 1_000_000L else 0L
     while (!condition()) {
+      if (deadline != 0L && System.nanoTime() - deadline > 0) {
+        return false
+      }
       if (!PumpRegistry.pumpAll()) {
         LockSupport.parkNanos(100_000L)
       }
     }
+    return true
   }
 }
 
@@ -1024,13 +1085,12 @@ internal class PendingStream(
   private var closed = false
 
   fun <Item> next(itemType: Class<Item>): StreamNext<Item> {
-    while (queue.isEmpty()) {
-      if (finished || closed) {
-        return StreamNext.Done
-      }
-      if (!PumpRegistry.pumpAll()) {
-        LockSupport.parkNanos(100_000L)
-      }
+    val settled = peer.waitFor { queue.isNotEmpty() || finished || closed }
+    if (!settled) {
+      return StreamNext.RemoteErr("timeout")
+    }
+    if (queue.isEmpty()) {
+      return StreamNext.Done
     }
 
     val event = queue.removeFirst()
@@ -1044,7 +1104,12 @@ internal class PendingStream(
     }
 
     val raw = event.bodyJson ?: "null"
-    return StreamNext.Item(codec.decode(raw, itemType))
+    return try {
+      StreamNext.Item(codec.decode(raw, itemType))
+    } catch (error: Throwable) {
+      if (error is VirtualMachineError && error !is StackOverflowError) throw error
+      StreamNext.RemoteErr("invalid stream item")
+    }
   }
 
   fun close() {
