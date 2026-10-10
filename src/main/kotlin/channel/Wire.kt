@@ -223,7 +223,8 @@ private class JsonEnvelopeParser(private val input: String) {
         "topic" -> topic = parseNullableString()
         "body" -> bodyJson = parseRawValue()
         "context" -> contextJson = parseRawValue()
-        "error" -> errorText = parseNullableString()
+        // A non-string error (e.g. an object from a non-conforming peer) is kept as its raw JSON text.
+        "error" -> errorText = if (peek('"') || input.startsWith("null", index)) parseNullableString() else parseRawValue()
         "done" -> done = parseBoolean()
         else -> parseRawValue()
       }

@@ -1,5 +1,6 @@
 package channel
 
+import org.junit.jupiter.api.Timeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -61,6 +62,7 @@ class CoreParityTest {
   }
 
   @Test
+  @Timeout(60) // used to deadlock forever (AUDIT 3.2): nested calls from a handler must not hang the suite
   fun websocketClientAndServerSupportNestedCallsEventsAndHeaders() {
     var mirroredEvents = 0
     var disconnects = 0

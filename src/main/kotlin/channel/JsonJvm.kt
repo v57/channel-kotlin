@@ -23,6 +23,7 @@ private class DslJsonCodec : JsonCodec {
 
   override fun decode(text: String): Any? {
     val bytes = text.toByteArray(Charsets.UTF_8)
+    checkJsonDepth(bytes)
     return dslJson.deserialize(Any::class.java, bytes, bytes.size)
   }
 
@@ -34,6 +35,7 @@ private class DslJsonCodec : JsonCodec {
 
     val normalized = normalizeClass(type)
     val bytes = text.toByteArray(Charsets.UTF_8)
+    checkJsonDepth(bytes)
 
     @Suppress("UNCHECKED_CAST")
     return when {
@@ -46,6 +48,36 @@ private class DslJsonCodec : JsonCodec {
 }
 
 fun defaultJsonCodec(): JsonCodec = DslJsonCodec()
+
+/** Deepest array/object nesting accepted when decoding; dsl-json's reader is recursive. */
+internal const val MAX_JSON_DEPTH = 512
+
+/** Rejects input nested deeper than [MAX_JSON_DEPTH] before the recursive parser can overflow the stack. */
+internal fun checkJsonDepth(bytes: ByteArray) {
+  var depth = 0
+  var inString = false
+  var index = 0
+  while (index < bytes.size) {
+    val b = bytes[index].toInt()
+    if (inString) {
+      if (b == '\\'.code) {
+        index += 1
+      } else if (b == '"'.code) {
+        inString = false
+      }
+    } else if (b == '"'.code) {
+      inString = true
+    } else if (b == '['.code || b == '{'.code) {
+      depth += 1
+      if (depth > MAX_JSON_DEPTH) {
+        throw ChannelError("json nesting too deep")
+      }
+    } else if (b == ']'.code || b == '}'.code) {
+      depth -= 1
+    }
+    index += 1
+  }
+}
 
 internal fun normalizeClass(type: Class<*>): Class<*> = when (type) {
   java.lang.Integer.TYPE -> java.lang.Integer::class.java
@@ -75,7 +107,14 @@ internal fun <T> decodeRequiredJson(codec: JsonCodec, json: String?, type: Class
   if (json == null) {
     throw ChannelError("missing required value for ${type.simpleName}")
   }
-  return codec.decode(json, type)
+  return try {
+    codec.decode(json, type)
+  } catch (error: ChannelError) {
+    throw error
+  } catch (error: Exception) {
+    // Don't echo the JSON library's internal message (parser positions, class names) to the peer.
+    throw ChannelError("invalid value for ${type.simpleName}")
+  }
 }
 
 @PublishedApi

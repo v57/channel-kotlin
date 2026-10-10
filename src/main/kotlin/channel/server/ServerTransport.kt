@@ -59,7 +59,17 @@ private class ServerTransport<State>(
 
     val snapshot = connections.toList()
     snapshot.forEach { connection ->
-      progressed = connection.poll() || progressed
+      progressed = try {
+        connection.poll() || progressed
+      } catch (error: Throwable) {
+        if (error is VirtualMachineError && error !is StackOverflowError) {
+          throw error
+        }
+        // Bad handshake, malformed message, deep JSON, ...: drop this connection only and
+        // keep serving every other client.
+        connection.destroy()
+        true
+      }
     }
     return progressed
   }
@@ -76,10 +86,12 @@ private class ServerConnection<State>(
   private val options: ListenOptions<State>,
 ) : Transport {
   private val queue = ByteQueue()
-  private val frameAssembler = FrameAssembler()
+  private val maxPayload = options.maxPayload
+  private val frameAssembler = FrameAssembler(maxPayload)
   private var closed = false
   private var handshaken = false
   private var peer: Peer<State>? = null
+  private var stalledSince = 0L
 
   override fun sendFrame(payload: String) {
     if (closed) {
@@ -104,8 +116,9 @@ private class ServerConnection<State>(
     }
 
     var progressed = false
-    while (true) {
-      val buffer = ByteBuffer.allocate(2048)
+    // Read at most about one message ahead; frames are decoded (or rejected) below before reading more.
+    while (queue.size.toLong() < maxPayload.toLong() + MAX_HANDSHAKE_BYTES) {
+      val buffer = ByteBuffer.allocate(16_384)
       val read = try {
         socket.read(buffer)
       } catch (error: java.io.IOException) {
@@ -130,12 +143,16 @@ private class ServerConnection<State>(
       if (progressHandshake()) {
         return true
       }
+      if (queue.size > MAX_HANDSHAKE_BYTES) {
+        destroy()
+        return true
+      }
       return progressed
     }
 
-    while (true) {
+    while (!closed) {
       val frame = try {
-        tryReadFrame(queue, expectMasked = true, assembler = frameAssembler)
+        tryReadFrame(queue, expectMasked = true, assembler = frameAssembler, maxPayload = maxPayload)
       } catch (error: Throwable) {
         // Protocol error on this connection only (bad masking, unsupported
         // opcode, oversized frame, ...). Destroy the connection but do NOT
@@ -163,6 +180,10 @@ private class ServerConnection<State>(
     }
 
     return progressed
+  }
+
+  private companion object {
+    const val WRITE_STALL_TIMEOUT_NANOS = 10_000_000_000L
   }
 
   fun destroy() {
@@ -231,6 +252,7 @@ private class ServerConnection<State>(
       return
     }
     val buffer = ByteBuffer.wrap(bytes)
+    stalledSince = 0L
     while (buffer.hasRemaining()) {
       val written = try {
         socket.write(buffer)
@@ -240,7 +262,16 @@ private class ServerConnection<State>(
         return
       }
       if (written == 0) {
+        // A client that stops reading must not block the server thread forever.
+        if (stalledSince == 0L) {
+          stalledSince = System.nanoTime()
+        } else if (System.nanoTime() - stalledSince > WRITE_STALL_TIMEOUT_NANOS) {
+          destroy()
+          return
+        }
         LockSupport.parkNanos(100_000L)
+      } else {
+        stalledSince = 0L
       }
     }
   }

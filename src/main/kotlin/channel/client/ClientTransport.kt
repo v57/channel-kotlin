@@ -29,6 +29,8 @@ private class ClientTransport<State>(
 ) : Transport, Pollable {
   private val socket: SocketChannel = SocketChannel.open()
   private val queue = ByteQueue()
+  private val maxPayload = options.maxPayload
+  private val frameAssembler = FrameAssembler(maxPayload)
   private var closed = false
 
   val peer: Peer<State>
@@ -46,13 +48,17 @@ private class ClientTransport<State>(
       ),
     )
 
-    while (!socket.finishConnect()) {
-      if (!PumpRegistry.pumpAll()) {
-        LockSupport.parkNanos(100_000L)
+    try {
+      while (!socket.finishConnect()) {
+        if (!PumpRegistry.pumpAll()) {
+          LockSupport.parkNanos(100_000L)
+        }
       }
+      performHandshake(options.headers)
+    } catch (error: Throwable) {
+      runCatching { socket.close() }
+      throw error
     }
-
-    performHandshake(options.headers)
     peer = Peer(
       channel = channel,
       state = options.state ?: channel.makeDefaultState(),
@@ -67,7 +73,12 @@ private class ClientTransport<State>(
     if (closed) {
       return
     }
-    writeFully(encodeFrame(payload.toByteArray(Charsets.UTF_8), mask = true))
+    try {
+      writeFully(encodeFrame(payload.toByteArray(Charsets.UTF_8), mask = true))
+    } catch (error: java.io.IOException) {
+      // Peer went away mid-write: settle pending calls instead of throwing out of send().
+      disconnect()
+    }
   }
 
   override fun close() {
@@ -85,10 +96,30 @@ private class ClientTransport<State>(
     if (!isConnected()) {
       return false
     }
+    return try {
+      pollOnce()
+    } catch (error: Throwable) {
+      if (error is VirtualMachineError && error !is StackOverflowError) {
+        throw error
+      }
+      // A broken or hostile server (bad frame, oversized length, invalid JSON, ...) only
+      // disconnects this client: pending calls settle with "disconnected" instead of the
+      // exception escaping into whoever is pumping.
+      disconnect()
+      true
+    }
+  }
 
+  private fun disconnect() {
+    close()
+    peer.stop()
+  }
+
+  private fun pollOnce(): Boolean {
     var progressed = false
-    while (true) {
-      val temp = ByteBuffer.allocate(2048)
+    // Read at most about one message ahead; frames are decoded (or rejected) below before reading more.
+    while (queue.size.toLong() < maxPayload.toLong() + MAX_HANDSHAKE_BYTES) {
+      val temp = ByteBuffer.allocate(16_384)
       val read = socket.read(temp)
       if (read > 0) {
         progressed = true
@@ -96,34 +127,29 @@ private class ClientTransport<State>(
         continue
       }
       if (read < 0) {
-        close()
-        peer.stop()
+        disconnect()
         return true
       }
       break
     }
 
-    while (true) {
-      val frame = try {
-        tryReadFrame(queue, expectMasked = false)
-      } catch (error: Throwable) {
-        close()
-        peer.stop()
-        throw error
-      } ?: break
+    while (isConnected()) {
+      val frame = tryReadFrame(queue, expectMasked = false, assembler = frameAssembler, maxPayload = maxPayload) ?: break
       progressed = true
       when (frame.opcode) {
         0x1,
         0x2 -> peer.handleIncomingFrame(frame.payload.toString(Charsets.UTF_8))
         0x8 -> {
-          close()
-          peer.stop()
+          disconnect()
           return true
         }
 
         0x9 -> writeFully(encodeFrame(frame.payload, opcode = 0xA, mask = true))
         0xA -> Unit
-        else -> throw ChannelError("unsupported websocket opcode ${frame.opcode}")
+        else -> {
+          disconnect()
+          return true
+        }
       }
     }
 
@@ -163,6 +189,9 @@ private class ClientTransport<State>(
         return
       }
 
+      if (queue.size > MAX_HANDSHAKE_BYTES) {
+        throw ChannelError("websocket handshake response too large")
+      }
       val temp = ByteBuffer.allocate(2048)
       val read = socket.read(temp)
       if (read < 0) {
@@ -197,7 +226,7 @@ private class ClientTransport<State>(
     while (buffer.hasRemaining()) {
       val written = socket.write(buffer)
       if (written == 0) {
-        if (!PumpRegistry.pumpAll()) {
+        if (!PumpRegistry.pumpIfIdle()) {
           LockSupport.parkNanos(100_000L)
         }
       }

@@ -17,28 +17,35 @@ internal data class WebSocketFrame(
  * number of continuation frames (opcode 0) and a final continuation frame
  * (FIN=1). Control frames (ping/pong/close) may be interleaved.
  */
-internal class FrameAssembler {
+internal class FrameAssembler(private val maxPayload: Int = DEFAULT_MAX_PAYLOAD) {
   private var active = false
   private var opcode = 0
   private var payload = ByteArray(0)
+  private var size = 0
 
   fun isActive(): Boolean = active
 
   fun start(messageOpcode: Int, data: ByteArray) {
     active = true
     opcode = messageOpcode
-    payload = data
+    payload = ByteArray(0)
+    size = 0
+    append(data)
   }
 
   fun append(data: ByteArray) {
-    val merged = ByteArray(payload.size + data.size)
-    payload.copyInto(merged)
-    data.copyInto(merged, payload.size)
-    payload = merged
+    if (size.toLong() + data.size > maxPayload) {
+      throw ChannelError("websocket message too large")
+    }
+    if (size + data.size > payload.size) {
+      payload = payload.copyOf(maxOf(size + data.size, payload.size * 2))
+    }
+    data.copyInto(payload, size)
+    size += data.size
   }
 
   fun finish(): WebSocketFrame {
-    val frame = WebSocketFrame(opcode, payload)
+    val frame = WebSocketFrame(opcode, payload.copyOf(size))
     reset()
     return frame
   }
@@ -47,8 +54,15 @@ internal class FrameAssembler {
     active = false
     opcode = 0
     payload = ByteArray(0)
+    size = 0
   }
 }
+
+/** Default cap for one websocket message (single frame or reassembled fragments); Bun's default is 16 MiB. */
+const val DEFAULT_MAX_PAYLOAD: Int = 16 * 1024 * 1024
+
+/** Cap for the HTTP upgrade request/response head. */
+internal const val MAX_HANDSHAKE_BYTES: Int = 64 * 1024
 
 internal class ByteQueue(initialCapacity: Int = 4096) {
   private var data = ByteArray(initialCapacity)
@@ -137,6 +151,7 @@ internal fun tryReadFrame(
   queue: ByteQueue,
   expectMasked: Boolean,
   assembler: FrameAssembler? = null,
+  maxPayload: Int = DEFAULT_MAX_PAYLOAD,
 ): WebSocketFrame? {
   if (queue.size < 2) {
     return null
@@ -170,12 +185,19 @@ internal fun tryReadFrame(
       for (index in 2 until 10) {
         longValue = (longValue shl 8) or (queue.peek(index).toLong() and 0xFF)
       }
-      if (longValue > Int.MAX_VALUE) {
+      // A 64-bit length with the top bit set is negative as a Long: reject it with oversized ones.
+      if (longValue < 0 || longValue > maxPayload) {
         throw ChannelError("websocket frame too large")
       }
       payloadLength = longValue.toInt()
       offset = 10
     }
+  }
+  if (payloadLength > maxPayload) {
+    throw ChannelError("websocket frame too large")
+  }
+  if (opcode >= 0x8 && (!fin || payloadLength > 125)) {
+    throw ChannelError("invalid websocket control frame")
   }
 
   val maskKey = if (masked) {
@@ -189,7 +211,7 @@ internal fun tryReadFrame(
     null
   }
 
-  if (queue.size < offset + payloadLength) {
+  if (queue.size.toLong() < offset.toLong() + payloadLength) {
     return null
   }
 
