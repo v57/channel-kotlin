@@ -13,6 +13,11 @@ Gradle (project `verification`, jar `channel-kotlin`):
 implementation("verification:channel-kotlin:VERSION")
 ```
 
+# Dependencies
+
+[dsl-json](https://github.com/ngs-doo/dsl-json) (`dsl-json-java8`) for JSON, plus the Kotlin standard library and
+`kotlin-reflect`. The WebSocket client and server are written on Java NIO.
+
 # Usage
 
 ```kotlin
