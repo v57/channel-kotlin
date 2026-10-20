@@ -83,6 +83,16 @@ class CoreParityTest {
   }
 
   @Test
+  fun dynamicBodyAndContextMayBeAbsent() {
+    val process = Channel<MutableMap<String, Any?>>()
+      .post<Any?, String, Any?>("dyn") { request -> "${request.body}/${request.context}" }
+      .process(mutableMapOf())
+    assertEquals("null/null", process.send<String>("dyn").requireOk())
+    assertEquals("1/{a=2}", process.send<String>("dyn", 1, mapOf("a" to 2)).requireOk())
+    process.stop()
+  }
+
+  @Test
   @Timeout(60) // used to deadlock forever (AUDIT 3.2): nested calls from a handler must not hang the suite
   fun websocketClientAndServerSupportNestedCallsEventsAndHeaders() {
     var mirroredEvents = 0

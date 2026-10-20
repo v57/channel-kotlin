@@ -105,6 +105,11 @@ internal fun <T> decodeRequiredJson(codec: JsonCodec, json: String?, type: Class
   }
 
   if (json == null) {
+    // A dynamic (Any?) body or context may be absent, as `undefined` is in the TS reference.
+    if (normalizeClass(type) == Any::class.java) {
+      @Suppress("UNCHECKED_CAST")
+      return null as T
+    }
     throw ChannelError("missing required value for ${type.simpleName}")
   }
   return try {
