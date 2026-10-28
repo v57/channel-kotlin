@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# In the Hub checkout this runs in its toolchain container (HubTools/hub-run); elsewhere it runs here.
+hub_run="$(dirname "$0")/../../../HubTools/hub-run"
+[[ -n "${HUB_TOOLCHAIN:-}" || ! -x "$hub_run" ]] || exec "$hub_run" bash "$0" "$@"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-
-if [[ -x /opt/homebrew/opt/openjdk@21/bin/java ]]; then
-  export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
-  export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
-fi
 
 ./gradlew --no-daemon clean jvmTest jacocoJvmReport
 mkdir -p coverage
