@@ -119,7 +119,8 @@ stream), 30 s idle timeout, a keepalive from the client every 15 s, 16 MiB frame
 also accepts v2, which Bun's client switches to through compatible version negotiation. As with this port's
 WebSocket client there is no reconnect: a dropped connection fails pending calls with `"disconnected"`.
 
-Which languages support QUIC: see `channel/docs/quic.md`.
+Languages with QUIC: TypeScript, Go, Swift, C#, Rust, Python, Elixir, Java, Kotlin, C and Zig; Dart, Ruby and PHP stay
+on WebSocket (libraries and status in `channel/docs/quic.md`).
 
 # Design
 
