@@ -14,6 +14,9 @@ internal fun <State> createClient(channel: Channel<State>, address: String, opti
 }
 
 private fun normalizeClientAddress(address: String): URI {
+  if (address.startsWith("quic://")) {
+    throw ChannelError("quic:// addresses use connectQuic() from channel-kotlin-quic")
+  }
   val normalized = if (address.startsWith("ws://") || address.startsWith("wss://")) {
     address
   } else {
