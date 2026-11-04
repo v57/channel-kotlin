@@ -35,6 +35,8 @@ private class ClientTransport<State>(
   private val maxPayload = options.maxPayload
   private val frameAssembler = FrameAssembler(maxPayload)
   private var closed = false
+  private val connectDeadline =
+    if (options.connectTimeoutMillis > 0) System.nanoTime() + options.connectTimeoutMillis * 1_000_000L else 0L
 
   val peer: Peer<State>
 
@@ -53,6 +55,7 @@ private class ClientTransport<State>(
 
     try {
       while (!socket.finishConnect()) {
+        checkConnecting()
         if (!PumpRegistry.pumpAll()) {
           LockSupport.parkNanos(100_000L)
         }
@@ -201,12 +204,23 @@ private class ClientTransport<State>(
         throw ChannelError("connection closed during handshake")
       }
       if (read == 0) {
+        checkConnecting()
         if (!PumpRegistry.pumpAll()) {
           LockSupport.parkNanos(100_000L)
         }
         continue
       }
       queue.append(temp.array().copyOf(read))
+    }
+  }
+
+  /** A connect that can't finish ends when its thread is interrupted or its timeout passes. */
+  private fun checkConnecting() {
+    if (Thread.currentThread().isInterrupted) {
+      throw ChannelError("connect interrupted")
+    }
+    if (connectDeadline != 0L && System.nanoTime() - connectDeadline > 0) {
+      throw ChannelError("connect timed out")
     }
   }
 

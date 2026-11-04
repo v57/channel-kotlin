@@ -50,6 +50,8 @@ data class ConnectOptions<State>(
   val headers: String? = null,
   /** Largest websocket message accepted from the server; bigger ones disconnect (default 16 MiB). */
   val maxPayload: Int = DEFAULT_MAX_PAYLOAD,
+  /** How long the TCP connect and upgrade may take before `connect` throws; 0 waits for as long as it takes. */
+  val connectTimeoutMillis: Long = 0L,
 )
 
 data class ListenOptions<State>(
@@ -1047,12 +1049,12 @@ internal class Peer<State>(
   internal val requestTimeoutMillis: Long
     get() = channel.requestTimeoutMillis
 
-  /** Pumps until [condition] holds; returns false if the channel's request timeout elapsed first. */
+  /** Pumps until [condition] holds; returns false if the channel's request timeout elapsed or the thread was interrupted first. */
   internal fun waitFor(condition: () -> Boolean): Boolean {
     val timeout = requestTimeoutMillis
     val deadline = if (timeout > 0) System.nanoTime() + timeout * 1_000_000L else 0L
     while (!condition()) {
-      if (deadline != 0L && System.nanoTime() - deadline > 0) {
+      if (Thread.currentThread().isInterrupted || (deadline != 0L && System.nanoTime() - deadline > 0)) {
         return false
       }
       if (!PumpRegistry.pumpAll()) {
